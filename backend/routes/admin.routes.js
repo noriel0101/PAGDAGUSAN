@@ -1,9 +1,9 @@
 const express = require("express");
-const bcrypt = require("bcryptjs");
 
 const pool = require("../db");
 const requireAuth = require("../middleware/auth");
 const requireRole = require("../middleware/role");
+const { notifyOwnerApproved, notifyOwnerRejected } = require("../services/notifications");
 
 const router = express.Router();
 
@@ -155,59 +155,13 @@ router.get("/owners/:id", async (req, res) => {
   }
 });
 
-router.post("/owners", async (req, res) => {
-  try {
-    const { name, email, phone, password } = req.body;
-
-    if (!name || !email || !password) {
-      return res.status(400).json({
-        success: false,
-        message: "Name, email, and password are required",
-      });
-    }
-
-    const existing = await pool.query(
-      `SELECT id FROM users WHERE LOWER(email) = LOWER($1)`,
-      [email]
-    );
-
-    if (existing.rows.length > 0) {
-      return res.status(409).json({
-        success: false,
-        message: "An account with this email already exists",
-      });
-    }
-
-    const passwordHash = await bcrypt.hash(password, 12);
-
-    const result = await pool.query(
-      `
-      INSERT INTO users (name, email, phone, password_hash, role, status, email_verified)
-      VALUES ($1, $2, $3, $4, 'owner', 'active', false)
-      RETURNING id, name, email, phone, role, status, created_at
-      `,
-      [name, email, phone || null, passwordHash]
-    );
-
-    const user = result.rows[0];
-
-    return res.status(201).json({
-      success: true,
-      message: "Owner created successfully",
-      data: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-        status: user.status,
-        createdAt: user.created_at,
-      },
-    });
-  } catch (error) {
-    console.error("Create owner error:", error);
-    return res.status(500).json({ success: false, message: "Server error" });
-  }
+// Owners register themselves. An admin reviews that request; they do not
+// create the account.
+router.post("/owners", (req, res) => {
+  return res.status(403).json({
+    success: false,
+    message: "Admins cannot create owner accounts. The owner must register on their own.",
+  });
 });
 
 router.put("/owners/:id", async (req, res) => {
@@ -219,6 +173,22 @@ router.put("/owners/:id", async (req, res) => {
       return res.status(400).json({
         success: false,
         message: "Name and email are required",
+      });
+    }
+
+    const current = await pool.query(
+      `SELECT last_login_at FROM users WHERE id = $1 AND role = 'owner'`,
+      [id]
+    );
+
+    if (current.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Owner not found" });
+    }
+
+    if (current.rows[0].last_login_at) {
+      return res.status(403).json({
+        success: false,
+        message: "Admins cannot edit a dorm owner's personal information after the owner has logged in.",
       });
     }
 
@@ -269,36 +239,77 @@ router.put("/owners/:id", async (req, res) => {
   }
 });
 
-router.patch("/owners/:id/approve", async (req, res) => {
+// Approving / rejecting an owner and the owner's own notification are written in
+// the same transaction, so the owner is never told about a decision that did
+// not stick. Both share one helper because the two endpoints only differ by
+// the target status.
+async function setOwnerStatus(ownerId, nextStatus) {
+  const client = await pool.connect();
   try {
-    const { id } = req.params;
+    await client.query("BEGIN");
 
-    const result = await pool.query(
+    // Lock the row and capture the status BEFORE the update so a repeated
+    // approve/reject (e.g. a double tap) never creates a duplicate notification.
+    const before = await client.query(
+      `SELECT status FROM users WHERE id = $1 AND role = 'owner' FOR UPDATE`,
+      [ownerId]
+    );
+
+    if (before.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return { ok: false, status: 404, message: "Owner not found" };
+    }
+
+    const previousStatus = before.rows[0].status;
+
+    const result = await client.query(
       `
       UPDATE users
-      SET status = 'active', updated_at = NOW()
+      SET status = $2::account_status, updated_at = NOW()
       WHERE id = $1 AND role = 'owner'
       RETURNING id, name, email, phone, role, status
       `,
-      [id]
+      [ownerId, nextStatus]
     );
 
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Owner not found" });
+    const user = result.rows[0];
+
+    if (previousStatus !== nextStatus) {
+      if (nextStatus === "active") {
+        await notifyOwnerApproved(client, { ownerId: user.id, ownerName: user.name });
+      } else {
+        await notifyOwnerRejected(client, { ownerId: user.id, ownerName: user.name });
+      }
     }
 
-    const user = result.rows[0];
+    await client.query("COMMIT");
+    return { ok: true, data: user };
+  } catch (error) {
+    await client.query("ROLLBACK").catch(() => {});
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
+router.patch("/owners/:id/approve", async (req, res) => {
+  try {
+    const result = await setOwnerStatus(req.params.id, "active");
+
+    if (!result.ok) {
+      return res.status(result.status).json({ success: false, message: result.message });
+    }
 
     return res.json({
       success: true,
       message: "Owner approved successfully",
       data: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-        status: user.status,
+        id: result.data.id,
+        name: result.data.name,
+        email: result.data.email,
+        phone: result.data.phone,
+        role: result.data.role,
+        status: result.data.status,
       },
     });
   } catch (error) {
@@ -309,34 +320,22 @@ router.patch("/owners/:id/approve", async (req, res) => {
 
 router.patch("/owners/:id/reject", async (req, res) => {
   try {
-    const { id } = req.params;
+    const result = await setOwnerStatus(req.params.id, "rejected");
 
-    const result = await pool.query(
-      `
-      UPDATE users
-      SET status = 'rejected', updated_at = NOW()
-      WHERE id = $1 AND role = 'owner'
-      RETURNING id, name, email, phone, role, status
-      `,
-      [id]
-    );
-
-    if (result.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Owner not found" });
+    if (!result.ok) {
+      return res.status(result.status).json({ success: false, message: result.message });
     }
-
-    const user = result.rows[0];
 
     return res.json({
       success: true,
       message: "Owner registration rejected",
       data: {
-        id: user.id,
-        name: user.name,
-        email: user.email,
-        phone: user.phone,
-        role: user.role,
-        status: user.status,
+        id: result.data.id,
+        name: result.data.name,
+        email: result.data.email,
+        phone: result.data.phone,
+        role: result.data.role,
+        status: result.data.status,
       },
     });
   } catch (error) {
@@ -391,29 +390,99 @@ router.patch("/owners/:id/status", async (req, res) => {
   }
 });
 
+async function ownerRegistrationSeries(unit) {
+  const trunc = unit === "week" ? "week" : "month";
+  const span = unit === "week" ? "7 weeks" : "5 months";
+  const step = unit === "week" ? "1 week" : "1 month";
+  const label = unit === "week" ? "Mon DD" : "Mon";
+
+  const result = await pool.query(
+    `
+    WITH buckets AS (
+      SELECT generate_series(
+        date_trunc('${trunc}', NOW()) - interval '${span}',
+        date_trunc('${trunc}', NOW()),
+        interval '${step}'
+      ) AS bucket
+    )
+    SELECT to_char(b.bucket, '${label}') AS label,
+           COALESCE(COUNT(u.id), 0)::int AS count
+    FROM buckets b
+    LEFT JOIN users u
+      ON u.role = 'owner'
+     AND date_trunc('${trunc}', u.created_at) = b.bucket
+    GROUP BY b.bucket
+    ORDER BY b.bucket
+    `
+  );
+
+  return result.rows.map((row) => ({ label: row.label.trim(), count: row.count }));
+}
+
+router.get("/activity/overview", async (req, res) => {
+  try {
+    const [statusResult, week, month, recentResult] = await Promise.all([
+      pool.query(
+        `SELECT status, COUNT(*)::int AS count
+         FROM users
+         WHERE role = 'owner'
+         GROUP BY status
+         ORDER BY count DESC`
+      ),
+      ownerRegistrationSeries("week"),
+      ownerRegistrationSeries("month"),
+      pool.query(
+        `SELECT id, name, email, status, created_at
+         FROM users
+         WHERE role = 'owner'
+         ORDER BY created_at DESC
+         LIMIT 12`
+      ),
+    ]);
+
+    const byStatus = statusResult.rows.map((row) => ({
+      status: row.status,
+      count: row.count,
+    }));
+
+    return res.json({
+      success: true,
+      data: {
+        total: byStatus.reduce((sum, row) => sum + row.count, 0),
+        byStatus,
+        registrations: { week, month },
+        recent: recentResult.rows.map((row) => ({
+          id: row.id,
+          name: row.name,
+          email: row.email,
+          status: row.status,
+          createdAt: row.created_at,
+        })),
+      },
+    });
+  } catch (error) {
+    console.error("Admin activity overview error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
 router.get("/activity", async (req, res) => {
   try {
     const result = await pool.query(
-      `
-      SELECT
-        id,
-        user_id,
-        action,
-        details,
-        created_at
-      FROM audit_logs
-      ORDER BY created_at DESC
-      LIMIT 50
-      `
+      `SELECT id, name, status, created_at
+       FROM users
+       WHERE role = 'owner'
+       ORDER BY created_at DESC
+       LIMIT 50`
     );
 
     return res.json({
       success: true,
       data: result.rows.map((row) => ({
         id: row.id,
-        userId: row.user_id,
-        action: row.action,
-        details: row.details,
+        userId: row.id,
+        action: "Owner registered",
+        details: `${row.name} · ${row.status}`,
         createdAt: row.created_at,
       })),
     });

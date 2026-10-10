@@ -1,6 +1,0 @@
-{
-  "name": "BoardEase",
-  "description": "Smart Boarding House & Dormitory Management System with PostgreSQL persistence, dark theme, role-based dashboards, analytical reports, and social sharing.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}

@@ -3,6 +3,17 @@ const bcrypt = require("bcryptjs");
 const pool = require("../db");
 const requireAuth = require("../middleware/auth");
 const requireRole = require("../middleware/role");
+const {
+  notifyReservationApproved,
+  notifyReservationRejected,
+  notifyPaymentVerified,
+  notifyPaymentRejected,
+  notifyMaintenanceUpdated,
+  notifyAnnouncementPublished,
+  notifyLeaseAssigned,
+} = require("../services/notifications");
+const { toPublicPhotoUrl, toStoredPhotoPath } = require("../lib/photoUrl");
+const { formatError } = require("../lib/email");
 
 const router = express.Router();
 
@@ -19,12 +30,111 @@ function propertyOwnerWhereIdx(alias, idx) {
   return `EXISTS (SELECT 1 FROM properties prop WHERE prop.id = ${alias}.property_id AND prop.owner_id = $${idx})`;
 }
 
+const MAX_OWNER_PROPERTIES = 3;
+
+// A pending application on one room does not belong there once the tenant
+// already has an active lease on a different room.
+const HIDE_STALE_PENDING = `
+  AND NOT (
+    l.status = 'pending_approval'
+    AND EXISTS (
+      SELECT 1 FROM leases active_lease
+      WHERE active_lease.tenant_id = l.tenant_id
+        AND active_lease.status = 'active'
+        AND active_lease.id <> l.id
+    )
+  )`;
+
+async function cancelOtherPendingApplications(client, tenantId, keepLeaseId) {
+  await client.query(
+    `UPDATE leases
+     SET status = 'cancelled',
+         rejection_reason = 'Accepted for another room.',
+         updated_at = NOW()
+     WHERE tenant_id = $1 AND id <> $2 AND status = 'pending_approval'`,
+    [tenantId, keepLeaseId]
+  );
+}
+
+async function createOwnerProperty(uid, fields) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(`SELECT id FROM users WHERE id = $1 FOR UPDATE`, [uid]);
+    const countResult = await client.query(
+      `SELECT COUNT(*)::int AS total FROM properties WHERE owner_id = $1`,
+      [uid]
+    );
+    if (countResult.rows[0].total >= MAX_OWNER_PROPERTIES) {
+      const error = new Error(`You can add up to ${MAX_OWNER_PROPERTIES} properties`);
+      error.status = 409;
+      throw error;
+    }
+    const result = await client.query(
+      `INSERT INTO properties (owner_id, name, address, description, contact_number, latitude, longitude, status)
+       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
+       RETURNING id, name, address, description, contact_number, latitude, longitude, status, created_at`,
+      [
+        uid,
+        fields.name,
+        fields.address,
+        fields.description || null,
+        fields.contactNumber || null,
+        fields.latitude,
+        fields.longitude,
+      ]
+    );
+    await client.query("COMMIT");
+    return result.rows[0];
+  } catch (error) {
+    try {
+      await client.query("ROLLBACK");
+    } catch (_) {
+      /* the transaction was already closed */
+    }
+    throw error;
+  } finally {
+    client.release();
+  }
+}
+
 function isValidNumber(value) {
   return value !== null && value !== undefined && value !== "" && Number.isFinite(Number(value));
 }
 
 function isValidCapacity(value) {
   return Number.isInteger(Number(value)) && Number(value) > 0;
+}
+
+// ─── Location (latitude / longitude) ──────────────────
+// Coordinates belong to the authenticated owner's own property. They are
+// optional (existing properties may have no location), but when provided both
+// must be present, numeric, and within GPS bounds.
+function parseCoordinate(value) {
+  if (value === null || value === undefined || value === "") return null;
+  if (typeof value === "boolean") return undefined;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : undefined;
+}
+
+// Returns { latitude, longitude } when valid, or { error } when not.
+function validateCoordinates(latitude, longitude) {
+  const lat = parseCoordinate(latitude);
+  const lng = parseCoordinate(longitude);
+
+  if (lat === undefined || lng === undefined) {
+    return { error: "Latitude and longitude must be valid numbers" };
+  }
+  if ((lat === null) !== (lng === null)) {
+    return { error: "Both latitude and longitude are required together" };
+  }
+  if (lat !== null && (lat < -90 || lat > 90)) {
+    return { error: "Latitude must be between -90 and 90" };
+  }
+  if (lng !== null && (lng < -180 || lng > 180)) {
+    return { error: "Longitude must be between -180 and 180" };
+  }
+  return { latitude: lat, longitude: lng };
 }
 
 // ─── Maintenance workflow ────────────────────────────────
@@ -83,7 +193,8 @@ router.get("/stats", async (req, res) => {
       `SELECT COUNT(*)::int AS pending
        FROM leases l
        JOIN rooms r ON l.room_id = r.id
-       WHERE l.status = 'pending_approval' AND ${propertyOwnerWhereIdx("r", 1)}`,
+       WHERE l.status = 'pending_approval' AND ${propertyOwnerWhereIdx("r", 1)}
+         ${HIDE_STALE_PENDING}`,
       [uid]
     );
 
@@ -148,7 +259,8 @@ router.get("/dashboard", async (req, res) => {
       `SELECT COUNT(*)::int AS pending
        FROM leases l
        JOIN rooms r ON l.room_id = r.id
-       WHERE l.status = 'pending_approval' AND ${propertyOwnerWhereIdx("r", 1)}`,
+       WHERE l.status = 'pending_approval' AND ${propertyOwnerWhereIdx("r", 1)}
+         ${HIDE_STALE_PENDING}`,
       [uid]
     );
 
@@ -277,6 +389,7 @@ router.get("/properties", async (req, res) => {
 
     let query = `
       SELECT p.id, p.name, p.address, p.description, p.contact_number, p.status, p.created_at,
+             p.latitude, p.longitude,
              COUNT(r.id)::int AS total_rooms,
              COUNT(r.id) FILTER (WHERE r.status = 'available')::int AS available_rooms,
              COUNT(r.id) FILTER (WHERE r.status = 'occupied')::int AS occupied_rooms,
@@ -304,6 +417,8 @@ router.get("/properties", async (req, res) => {
         address: p.address,
         description: p.description,
         contactNumber: p.contact_number,
+        latitude: p.latitude != null ? Number(p.latitude) : null,
+        longitude: p.longitude != null ? Number(p.longitude) : null,
         status: p.status,
         createdAt: p.created_at,
         totalRooms: p.total_rooms,
@@ -327,30 +442,19 @@ router.post("/properties", async (req, res) => {
       return res.status(400).json({ success: false, message: "Name and address are required" });
     }
 
-    const existing = await pool.query(
-      `SELECT id FROM properties WHERE owner_id = $1 LIMIT 1`,
-      [uid]
-    );
-    if (existing.rows.length > 0) {
-      return res.status(409).json({ success: false, message: "You can only register one property" });
+    const coords = validateCoordinates(latitude, longitude);
+    if (coords.error) {
+      return res.status(400).json({ success: false, message: coords.error });
     }
 
-    const result = await pool.query(
-      `INSERT INTO properties (owner_id, name, address, description, contact_number, latitude, longitude, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
-       RETURNING id, name, address, description, contact_number, status, created_at`,
-      [
-        uid,
-        name,
-        address,
-        description || null,
-        contactNumber || null,
-        latitude != null ? latitude : null,
-        longitude != null ? longitude : null,
-      ]
-    );
-
-    const p = result.rows[0];
+    const p = await createOwnerProperty(uid, {
+      name,
+      address,
+      description,
+      contactNumber,
+      latitude: coords.latitude,
+      longitude: coords.longitude,
+    });
     return res.status(201).json({
       success: true,
       message: "Property created",
@@ -360,6 +464,8 @@ router.post("/properties", async (req, res) => {
         address: p.address,
         description: p.description,
         contactNumber: p.contact_number,
+        latitude: p.latitude != null ? Number(p.latitude) : null,
+        longitude: p.longitude != null ? Number(p.longitude) : null,
         status: p.status,
         createdAt: p.created_at,
         totalRooms: 0,
@@ -369,9 +475,12 @@ router.post("/properties", async (req, res) => {
       },
     });
   } catch (error) {
+    if (error.status === 409) {
+      return res.status(409).json({ success: false, message: error.message });
+    }
     console.error("Create property error:", error);
     if (error.code === "23505") {
-      return res.status(409).json({ success: false, message: "You can only register one property" });
+      return res.status(409).json({ success: false, message: `You can add up to ${MAX_OWNER_PROPERTIES} properties` });
     }
     return res.status(500).json({ success: false, message: "Server error" });
   }
@@ -380,11 +489,34 @@ router.post("/properties", async (req, res) => {
 router.get("/property", async (req, res) => {
   try {
     const result = await pool.query(
-      `SELECT id, name, address, description, contact_number, status, created_at, updated_at
-       FROM properties WHERE owner_id = $1 LIMIT 1`,
+      `SELECT p.id, p.name, p.address, p.description, p.contact_number, p.latitude, p.longitude, p.status, p.created_at, p.updated_at,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                  'id', pp.id,
+                  'photo_url', pp.photo_url,
+                  'is_primary', pp.is_primary
+                ) ORDER BY pp.is_primary DESC, pp.created_at ASC)
+                FROM property_photos pp WHERE pp.property_id = p.id
+              ), '[]'::json) AS photos
+       FROM properties p WHERE p.owner_id = $1 LIMIT 1`,
       [req.user.userId]
     );
-    return res.json({ success: true, data: result.rows[0] || null });
+    const p = result.rows[0] || null;
+    return res.json({
+      success: true,
+      data: p
+        ? {
+            ...p,
+            latitude: p.latitude != null ? Number(p.latitude) : null,
+            longitude: p.longitude != null ? Number(p.longitude) : null,
+            photos: (p.photos || []).map((pp) => ({
+              id: pp.id,
+              photoUrl: toPublicPhotoUrl(req, pp.photo_url),
+              isPrimary: pp.is_primary,
+            })),
+          }
+        : null,
+    });
   } catch (error) {
     console.error("Get owner property error:", error);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -398,26 +530,35 @@ router.post("/property", async (req, res) => {
       return res.status(400).json({ success: false, message: "Name and address are required" });
     }
 
-    const existing = await pool.query(
-      `SELECT id FROM properties WHERE owner_id = $1 LIMIT 1`,
-      [req.user.userId]
-    );
-    if (existing.rows.length > 0) {
-      return res.status(409).json({ success: false, message: "You can only register one property" });
+    const coords = validateCoordinates(latitude, longitude);
+    if (coords.error) {
+      return res.status(400).json({ success: false, message: coords.error });
     }
 
-    const result = await pool.query(
-      `INSERT INTO properties (owner_id, name, address, description, contact_number, latitude, longitude, status)
-       VALUES ($1, $2, $3, $4, $5, $6, $7, 'active')
-       RETURNING id, name, address, description, contact_number, status, created_at`,
-      [req.user.userId, name.trim(), address.trim(), description || null, contactNumber || null,
-        latitude != null ? latitude : null, longitude != null ? longitude : null]
-    );
-    return res.status(201).json({ success: true, message: "Property created", data: result.rows[0] });
+    const p = await createOwnerProperty(req.user.userId, {
+      name: name.trim(),
+      address: address.trim(),
+      description,
+      contactNumber,
+      latitude: coords.latitude,
+      longitude: coords.longitude,
+    });
+    return res.status(201).json({
+      success: true,
+      message: "Property created",
+      data: {
+        ...p,
+        latitude: p.latitude != null ? Number(p.latitude) : null,
+        longitude: p.longitude != null ? Number(p.longitude) : null,
+      },
+    });
   } catch (error) {
+    if (error.status === 409) {
+      return res.status(409).json({ success: false, message: error.message });
+    }
     console.error("Create owner property error:", error);
     if (error.code === "23505") {
-      return res.status(409).json({ success: false, message: "You can only register one property" });
+      return res.status(409).json({ success: false, message: `You can add up to ${MAX_OWNER_PROPERTIES} properties` });
     }
     return res.status(500).json({ success: false, message: "Server error" });
   }
@@ -430,19 +571,35 @@ router.put("/property", async (req, res) => {
       return res.status(400).json({ success: false, message: "Name and address are required" });
     }
 
+    const coords = validateCoordinates(latitude, longitude);
+    if (coords.error) {
+      return res.status(400).json({ success: false, message: coords.error });
+    }
+
     const result = await pool.query(
       `UPDATE properties
        SET name = $1, address = $2, description = $3, contact_number = $4,
            latitude = COALESCE($5, latitude), longitude = COALESCE($6, longitude), updated_at = NOW()
-       WHERE owner_id = $7
-       RETURNING id, name, address, description, contact_number, status, updated_at`,
+       WHERE id = (
+         SELECT id FROM properties WHERE owner_id = $7 ORDER BY created_at ASC LIMIT 1
+       )
+       RETURNING id, name, address, description, contact_number, latitude, longitude, status, updated_at`,
       [name.trim(), address.trim(), description || null, contactNumber || null,
-        latitude != null ? latitude : null, longitude != null ? longitude : null, req.user.userId]
+        coords.latitude, coords.longitude, req.user.userId]
     );
     if (result.rows.length === 0) {
       return res.status(404).json({ success: false, message: "Property not found" });
     }
-    return res.json({ success: true, message: "Property updated", data: result.rows[0] });
+    const p = result.rows[0];
+    return res.json({
+      success: true,
+      message: "Property updated",
+      data: {
+        ...p,
+        latitude: p.latitude != null ? Number(p.latitude) : null,
+        longitude: p.longitude != null ? Number(p.longitude) : null,
+      },
+    });
   } catch (error) {
     console.error("Update owner property error:", error);
     return res.status(500).json({ success: false, message: "Server error" });
@@ -456,10 +613,19 @@ router.get("/properties/:id", async (req, res) => {
 
     const result = await pool.query(
       `SELECT p.id, p.name, p.address, p.description, p.contact_number, p.status, p.created_at, p.updated_at,
+              p.latitude, p.longitude,
               COUNT(r.id)::int AS total_rooms,
               COUNT(r.id) FILTER (WHERE r.status = 'available')::int AS available_rooms,
               COUNT(r.id) FILTER (WHERE r.status = 'occupied')::int AS occupied_rooms,
-              COUNT(r.id) FILTER (WHERE r.status = 'maintenance')::int AS maintenance_rooms
+              COUNT(r.id) FILTER (WHERE r.status = 'maintenance')::int AS maintenance_rooms,
+              COALESCE((
+                SELECT json_agg(json_build_object(
+                  'id', pp.id,
+                  'photo_url', pp.photo_url,
+                  'is_primary', pp.is_primary
+                ) ORDER BY pp.is_primary DESC, pp.created_at ASC)
+                FROM property_photos pp WHERE pp.property_id = p.id
+              ), '[]'::json) AS photos
        FROM properties p
        LEFT JOIN rooms r ON r.property_id = p.id
        WHERE p.id = $2 AND p.owner_id = $1
@@ -480,6 +646,8 @@ router.get("/properties/:id", async (req, res) => {
         address: p.address,
         description: p.description,
         contactNumber: p.contact_number,
+        latitude: p.latitude != null ? Number(p.latitude) : null,
+        longitude: p.longitude != null ? Number(p.longitude) : null,
         status: p.status,
         createdAt: p.created_at,
         updatedAt: p.updated_at,
@@ -487,6 +655,11 @@ router.get("/properties/:id", async (req, res) => {
         availableRooms: p.available_rooms,
         occupiedRooms: p.occupied_rooms,
         maintenanceRooms: p.maintenance_rooms,
+        photos: (p.photos || []).map((pp) => ({
+          id: pp.id,
+          photoUrl: toPublicPhotoUrl(req, pp.photo_url),
+          isPrimary: pp.is_primary,
+        })),
       },
     });
   } catch (error) {
@@ -505,6 +678,20 @@ router.put("/properties/:id", async (req, res) => {
       return res.status(400).json({ success: false, message: "Name and address are required" });
     }
 
+    const coords = validateCoordinates(latitude, longitude);
+    if (coords.error) {
+      return res.status(400).json({ success: false, message: coords.error });
+    }
+
+    // A property owned by someone else is reported exactly like one that does
+    // not exist, so probing ids can never confirm that another owner's property
+    // is real. The UPDATE below stays scoped by owner_id as well, so the write
+    // itself matches 0 rows even if this guard were ever bypassed.
+    const exists = await pool.query(`SELECT id FROM properties WHERE id = $1 AND owner_id = $2`, [id, uid]);
+    if (exists.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Property not found" });
+    }
+
     const result = await pool.query(
       `UPDATE properties
        SET name = $1,
@@ -515,14 +702,14 @@ router.put("/properties/:id", async (req, res) => {
            longitude = COALESCE($6, longitude),
            updated_at = NOW()
        WHERE id = $7 AND owner_id = $8
-       RETURNING id, name, address, description, contact_number, status`,
+       RETURNING id, name, address, description, contact_number, latitude, longitude, status`,
       [
         name,
         address,
         description || null,
         contactNumber || null,
-        latitude != null ? latitude : null,
-        longitude != null ? longitude : null,
+        coords.latitude,
+        coords.longitude,
         id,
         uid,
       ]
@@ -542,6 +729,8 @@ router.put("/properties/:id", async (req, res) => {
         address: p.address,
         description: p.description,
         contactNumber: p.contact_number,
+        latitude: p.latitude != null ? Number(p.latitude) : null,
+        longitude: p.longitude != null ? Number(p.longitude) : null,
         status: p.status,
       },
     });
@@ -580,6 +769,51 @@ router.patch("/properties/:id/status", async (req, res) => {
     });
   } catch (error) {
     console.error("Update property status error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// Save (or clear) the dorm's map location. Passing null for both coordinates
+// removes the location. Cross-owner access is deliberately NOT distinguished
+// from a missing property: both answer 404 "Property not found", so probing
+// ids cannot confirm that another owner's property exists.
+router.patch("/properties/:id/location", async (req, res) => {
+  try {
+    const uid = req.user.userId;
+    const { id } = req.params;
+    const { latitude, longitude } = req.body;
+
+    const coords = validateCoordinates(latitude, longitude);
+    if (coords.error) {
+      return res.status(400).json({ success: false, message: coords.error });
+    }
+
+    const exists = await pool.query(`SELECT id FROM properties WHERE id = $1 AND owner_id = $2`, [id, uid]);
+    if (exists.rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Property not found" });
+    }
+
+    const result = await pool.query(
+      `UPDATE properties
+       SET latitude = $1, longitude = $2, updated_at = NOW()
+       WHERE id = $3 AND owner_id = $4
+       RETURNING id, latitude, longitude, updated_at`,
+      [coords.latitude, coords.longitude, id, uid]
+    );
+
+    const p = result.rows[0];
+    return res.json({
+      success: true,
+      message: "Property location updated",
+      data: {
+        id: p.id,
+        latitude: p.latitude != null ? Number(p.latitude) : null,
+        longitude: p.longitude != null ? Number(p.longitude) : null,
+        updatedAt: p.updated_at,
+      },
+    });
+  } catch (error) {
+    console.error("Update property location error:", error);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 });
@@ -664,12 +898,14 @@ router.post("/properties/:propertyId/rooms", async (req, res) => {
       return res.status(400).json({ success: false, message: "Capacity must be at least 1" });
     }
 
+    // Owner-scoped: a property that isn't this owner's returns no rows, exactly
+    // like a missing one, so 404 discloses nothing about other owners.
     const propCheck = await pool.query(
       `SELECT id FROM properties WHERE id = $1 AND owner_id = $2`,
       [propertyId, uid]
     );
     if (propCheck.rows.length === 0) {
-      return res.status(403).json({ success: false, message: "Property not found or not yours" });
+      return res.status(404).json({ success: false, message: "Property not found" });
     }
 
     const dupCheck = await pool.query(
@@ -803,6 +1039,7 @@ router.get("/rooms/:id", async (req, res) => {
        FROM users u
        JOIN leases l ON l.tenant_id = u.id
        WHERE l.room_id = $1 AND l.status IN ('active', 'pending_approval')
+         ${HIDE_STALE_PENDING}
        ORDER BY u.name`,
       [id]
     );
@@ -850,12 +1087,14 @@ router.post("/rooms", async (req, res) => {
       return res.status(400).json({ success: false, message: "Capacity must be at least 1" });
     }
 
+    // Owner-scoped: a property that isn't this owner's returns no rows, exactly
+    // like a missing one, so 404 discloses nothing about other owners.
     const propCheck = await pool.query(
       `SELECT id FROM properties WHERE id = $1 AND owner_id = $2`,
       [propertyId, uid]
     );
     if (propCheck.rows.length === 0) {
-      return res.status(403).json({ success: false, message: "Property not found or not yours" });
+      return res.status(404).json({ success: false, message: "Property not found" });
     }
 
     const dupCheck = await pool.query(
@@ -1115,7 +1354,7 @@ router.get("/tenants", async (req, res) => {
       idx++;
     }
 
-    query += ` ORDER BY u.id, l.created_at DESC`;
+    query += ` ORDER BY u.id, CASE WHEN l.status = 'active' THEN 0 ELSE 1 END, l.created_at DESC`;
 
     const result = await pool.query(query, params);
 
@@ -1161,7 +1400,7 @@ router.get("/tenants/:id", async (req, res) => {
        JOIN rooms r ON l.room_id = r.id
        JOIN properties p ON r.property_id = p.id
        WHERE u.id = $2 AND p.owner_id = $1
-       ORDER BY u.id, l.created_at DESC`,
+       ORDER BY u.id, CASE WHEN l.status = 'active' THEN 0 ELSE 1 END, l.created_at DESC`,
       [uid, id]
     );
 
@@ -1229,9 +1468,15 @@ router.post("/tenants", async (req, res) => {
       return res.status(400).json({ success: false, message: "Name, email, and password are required" });
     }
 
+    const emailError = formatError(email);
+    if (emailError) {
+      return res.status(400).json({ success: false, message: emailError });
+    }
+    const normalizedEmail = String(email).trim().toLowerCase();
+
     const existing = await pool.query(
       `SELECT id FROM users WHERE LOWER(email) = LOWER($1)`,
-      [email]
+      [normalizedEmail]
     );
     if (existing.rows.length > 0) {
       return res.status(409).json({ success: false, message: "An account with this email already exists" });
@@ -1246,7 +1491,7 @@ router.post("/tenants", async (req, res) => {
         [uid, roomId]
       );
       if (roomResult.rows.length === 0) {
-        return res.status(403).json({ success: false, message: "Room not found or not yours" });
+        return res.status(404).json({ success: false, message: "Room not found" });
       }
       room = roomResult.rows[0];
       if (room.status === "inactive" || room.status === "maintenance") {
@@ -1254,13 +1499,6 @@ router.post("/tenants", async (req, res) => {
       }
       if (room.current_occupancy >= room.capacity) {
         return res.status(409).json({ success: false, message: "Room is at full capacity" });
-      }
-      const roomLease = await pool.query(
-        `SELECT id FROM leases WHERE room_id = $1 AND status = 'active' LIMIT 1`,
-        [room.id]
-      );
-      if (roomLease.rows.length > 0) {
-        return res.status(409).json({ success: false, message: "Room already has an active lease" });
       }
     }
 
@@ -1275,7 +1513,7 @@ router.post("/tenants", async (req, res) => {
         `INSERT INTO users (name, email, phone, password_hash, role, status, email_verified)
          VALUES ($1, $2, $3, $4, 'tenant', 'active', false)
          RETURNING id, name, email, phone, role, status, created_at`,
-        [name, email, phone || null, passwordHash]
+        [name, normalizedEmail, phone || null, passwordHash]
       );
       user = userResult.rows[0];
 
@@ -1328,51 +1566,14 @@ function tenantOwnedBy(sqlAlias, uidIdx, tenantIdIdx) {
   )`;
 }
 
-router.put("/tenants/:id", async (req, res) => {
-  try {
-    const uid = req.user.userId;
-    const { id } = req.params;
-    const { name, email, phone } = req.body;
-
-    if (!name || !email) {
-      return res.status(400).json({ success: false, message: "Name and email are required" });
-    }
-
-    const ownerCheck = await pool.query(
-      `SELECT u.id FROM users u
-       WHERE u.id = $2 AND u.role = 'tenant' AND ${tenantOwnedBy("u", 1, 2)}`,
-      [uid, id]
-    );
-    if (ownerCheck.rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Tenant not found" });
-    }
-
-    const existing = await pool.query(
-      `SELECT id FROM users WHERE LOWER(email) = LOWER($1) AND id <> $2`,
-      [email, id]
-    );
-    if (existing.rows.length > 0) {
-      return res.status(409).json({ success: false, message: "An account with this email already exists" });
-    }
-
-    const result = await pool.query(
-      `UPDATE users
-       SET name = $1, email = $2, phone = $3, updated_at = NOW()
-       WHERE id = $4 AND role = 'tenant'
-       RETURNING id, name, email, phone, status`,
-      [name, email, phone || null, id]
-    );
-
-    const t = result.rows[0];
-    return res.json({
-      success: true,
-      message: "Tenant updated",
-      data: { id: t.id, name: t.name, email: t.email, phone: t.phone, accountStatus: t.status },
-    });
-  } catch (error) {
-    console.error("Update tenant error:", error);
-    return res.status(500).json({ success: false, message: "Server error" });
-  }
+// A tenant's personal information (name, email, phone) belongs to the tenant.
+// Owners can only change the account status (below) and manage leases; the
+// tenant edits their own details from their profile screen.
+router.put("/tenants/:id", (req, res) => {
+  return res.status(403).json({
+    success: false,
+    message: "Owners cannot edit a tenant's personal information. Only the tenant can update their own profile.",
+  });
 });
 
 router.patch("/tenants/:id/status", async (req, res) => {
@@ -1424,13 +1625,15 @@ router.post("/leases", async (req, res) => {
     }
 
     const roomResult = await pool.query(
-      `SELECT r.id, r.room_number, r.monthly_rent, r.security_deposit, r.status, r.capacity, r.current_occupancy
+      `SELECT r.id, r.room_number, r.monthly_rent, r.security_deposit, r.status, r.capacity, r.current_occupancy,
+              p.name AS property_name
        FROM rooms r
+       JOIN properties p ON p.id = r.property_id
        WHERE r.id = $2 AND ${propertyOwnerWhereIdx("r", 1)}`,
       [uid, roomId]
     );
     if (roomResult.rows.length === 0) {
-      return res.status(403).json({ success: false, message: "Room not found or not yours" });
+      return res.status(404).json({ success: false, message: "Room not found" });
     }
     const room = roomResult.rows[0];
     if (room.status === "inactive" || room.status === "maintenance") {
@@ -1438,14 +1641,6 @@ router.post("/leases", async (req, res) => {
     }
     if (room.current_occupancy >= room.capacity) {
       return res.status(409).json({ success: false, message: "Room is at full capacity" });
-    }
-
-    const roomLease = await pool.query(
-      `SELECT id FROM leases WHERE room_id = $1 AND status = 'active' LIMIT 1`,
-      [room.id]
-    );
-    if (roomLease.rows.length > 0) {
-      return res.status(409).json({ success: false, message: "Room already has an active lease" });
     }
 
     const tenantCheck = await pool.query(
@@ -1459,30 +1654,52 @@ router.post("/leases", async (req, res) => {
 
     const activeLease = await pool.query(
       `SELECT id FROM leases
-       WHERE tenant_id = $1 AND status IN ('active', 'pending_approval')
+       WHERE tenant_id = $1 AND status = 'active'
        LIMIT 1`,
       [tenantId]
     );
     if (activeLease.rows.length > 0) {
-      return res.status(409).json({ success: false, message: "Tenant already has an active lease or pending reservation" });
+      return res.status(409).json({ success: false, message: "Tenant already has an active lease" });
     }
 
-    const result = await pool.query(
-      `INSERT INTO leases (tenant_id, room_id, monthly_rent, security_deposit, status, start_date)
-       VALUES ($1, $2, $3, $4, 'active', $5)
-       RETURNING id, tenant_id, room_id, start_date, monthly_rent, status`,
-      [
-        tenantId,
-        roomId,
-        monthlyRent != null ? monthlyRent : room.monthly_rent,
-        securityDeposit != null ? securityDeposit : room.security_deposit || 0,
-        startDate || new Date().toISOString().slice(0, 10),
-      ]
-    );
+    // The lease and the tenant's notification are committed together.
+    const client = await pool.connect();
+    let lease;
+    try {
+      await client.query("BEGIN");
+
+      const result = await client.query(
+        `INSERT INTO leases (tenant_id, room_id, monthly_rent, security_deposit, status, start_date)
+         VALUES ($1, $2, $3, $4, 'active', $5)
+         RETURNING id, tenant_id, room_id, start_date, monthly_rent, status`,
+        [
+          tenantId,
+          roomId,
+          monthlyRent != null ? monthlyRent : room.monthly_rent,
+          securityDeposit != null ? securityDeposit : room.security_deposit || 0,
+          startDate || new Date().toISOString().slice(0, 10),
+        ]
+      );
+      lease = result.rows[0];
+      await cancelOtherPendingApplications(client, lease.tenant_id, lease.id);
+
+      await notifyLeaseAssigned(client, {
+        tenantId: lease.tenant_id,
+        roomNumber: room.room_number,
+        propertyName: room.property_name,
+        leaseId: lease.id,
+      });
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
 
     // NOTE: room occupancy + status are updated by the lease_occupancy and room_status DB triggers.
 
-    const lease = result.rows[0];
     return res.status(201).json({
       success: true,
       message: `Assigned ${tenantCheck.rows[0].name} to room ${room.room_number}`,
@@ -1663,7 +1880,8 @@ async function processPayment(uid, paymentId, nextStatus, rejectionReason) {
     await client.query("BEGIN");
 
     const payResult = await client.query(
-      `SELECT p.id, p.lease_id, p.amount, p.status AS current_status
+      `SELECT p.id, p.lease_id, p.amount, p.status AS current_status,
+              p.tenant_id, r.room_number, prop.name AS property_name
        FROM payments p
        JOIN leases l ON p.lease_id = l.id
        JOIN rooms r ON l.room_id = r.id
@@ -1703,6 +1921,20 @@ async function processPayment(uid, paymentId, nextStatus, rejectionReason) {
        WHERE id = $4`,
       [nextStatus, nextStatus === "rejected" ? rejectionReason || null : null, uid, paymentId]
     );
+
+    // The status flip and the tenant's notification share this transaction.
+    const context = {
+      tenantId: pay.tenant_id,
+      amount: pay.amount,
+      roomNumber: pay.room_number,
+      propertyName: pay.property_name,
+      paymentId,
+    };
+    if (nextStatus === "rejected") {
+      await notifyPaymentRejected(client, { ...context, reason: rejectionReason || null });
+    } else {
+      await notifyPaymentVerified(client, context);
+    }
 
     await client.query("COMMIT");
     return { ok: true, data: { id: paymentId, status: nextStatus } };
@@ -1787,6 +2019,8 @@ router.get("/reservations", async (req, res) => {
     } else {
       query += ` AND l.status IN ('pending_approval', 'active', 'rejected', 'cancelled', 'terminated')`;
     }
+
+    query += HIDE_STALE_PENDING;
 
     query += ` ORDER BY l.created_at DESC`;
 
@@ -1898,7 +2132,8 @@ async function approveReservation(uid, reservationId) {
 
     const leaseResult = await client.query(
       `SELECT l.id, l.tenant_id, l.room_id, l.status AS lease_status,
-              r.capacity, r.current_occupancy, r.room_number
+              r.capacity, r.current_occupancy, r.room_number,
+              p.name AS property_name
        FROM leases l
        JOIN rooms r ON r.id = l.room_id
        JOIN properties p ON p.id = r.property_id
@@ -1965,12 +2200,14 @@ async function approveReservation(uid, reservationId) {
       [reservationId]
     );
 
+    await cancelOtherPendingApplications(client, lease.tenant_id, reservationId);
+
     // If approving this lease filled the room, cancel the other pending
     // reservations for the same room so no one is left waiting on a full room.
     const occResult = await client.query(
       `SELECT COUNT(*)::int AS occ
        FROM leases
-       WHERE room_id = $1 AND status IN ('active', 'pending_approval')`,
+       WHERE room_id = $1 AND status = 'active'`,
       [lease.room_id]
     );
 
@@ -1985,10 +2222,28 @@ async function approveReservation(uid, reservationId) {
       );
     }
 
+    // The status flip and the tenant's notification share this transaction.
+    await notifyReservationApproved(client, {
+      tenantId: lease.tenant_id,
+      roomNumber: lease.room_number,
+      propertyName: lease.property_name,
+      reservationId,
+    });
+
     await client.query("COMMIT");
     return { ok: true, data: { id: lease.id, status: "active", roomId: lease.room_id } };
   } catch (error) {
     await client.query("ROLLBACK").catch(() => {});
+    if (error && error.code === "23505") {
+      const tenantClash = String(error.constraint || "").includes("tenant");
+      return {
+        ok: false,
+        status: 409,
+        message: tenantClash
+          ? "Tenant already has an active lease."
+          : "This room is already at full capacity.",
+      };
+    }
     throw error;
   } finally {
     client.release();
@@ -2001,7 +2256,8 @@ async function rejectReservation(uid, reservationId, reason) {
     await client.query("BEGIN");
 
     const leaseResult = await client.query(
-      `SELECT l.id, l.status AS lease_status
+      `SELECT l.id, l.tenant_id, l.status AS lease_status,
+              r.room_number, p.name AS property_name
        FROM leases l
        JOIN rooms r ON r.id = l.room_id
        JOIN properties p ON p.id = r.property_id
@@ -2030,6 +2286,16 @@ async function rejectReservation(uid, reservationId, reason) {
        WHERE id = $1`,
       [reservationId, reason || null]
     );
+
+    // The status flip and the tenant's notification share this transaction.
+    const rejected = leaseResult.rows[0];
+    await notifyReservationRejected(client, {
+      tenantId: rejected.tenant_id,
+      roomNumber: rejected.room_number,
+      propertyName: rejected.property_name,
+      reservationId,
+      reason: reason || null,
+    });
 
     await client.query("COMMIT");
     return { ok: true, data: { id: leaseResult.rows[0].id, status: "rejected" } };
@@ -2257,7 +2523,7 @@ router.patch("/maintenance/:id/status", async (req, res) => {
     }
 
     const result = await pool.query(
-      `SELECT m.id, m.status AS current_status
+      `SELECT m.id, m.tenant_id, m.title, m.status AS current_status
        FROM maintenance_requests m
        JOIN rooms r ON m.room_id = r.id
        WHERE m.id = $2 AND ${propertyOwnerWhereIdx("r", 1)}
@@ -2279,20 +2545,42 @@ router.patch("/maintenance/:id/status", async (req, res) => {
       });
     }
 
-    const update = await pool.query(
-      `UPDATE maintenance_requests
-       SET status = $2::maintenance_status,
-           completed_at = CASE WHEN $2::text = 'completed' THEN NOW() ELSE NULL END,
-           updated_at = NOW()
-       WHERE id = $1
-       RETURNING id, status, updated_at`,
-      [id, status]
-    );
+    // The status change and the tenant's notification share this transaction.
+    const client = await pool.connect();
+    let update;
+    try {
+      await client.query("BEGIN");
+
+      const updated = await client.query(
+        `UPDATE maintenance_requests
+         SET status = $2::maintenance_status,
+             completed_at = CASE WHEN $2::text = 'completed' THEN NOW() ELSE NULL END,
+             updated_at = NOW()
+         WHERE id = $1
+         RETURNING id, status, updated_at`,
+        [id, status]
+      );
+      update = updated.rows[0];
+
+      await notifyMaintenanceUpdated(client, {
+        tenantId: result.rows[0].tenant_id,
+        title: result.rows[0].title,
+        status: update.status,
+        maintenanceId: update.id,
+      });
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
 
     return res.json({
       success: true,
       message: "Status updated",
-      data: { id: update.rows[0].id, status: update.rows[0].status },
+      data: { id: update.id, status: update.status },
     });
   } catch (error) {
     console.error("Update maintenance status error:", error);
@@ -2540,7 +2828,7 @@ router.patch("/announcements/:id/publish", async (req, res) => {
     const { id } = req.params;
 
     const current = await pool.query(
-      `SELECT id, status FROM announcements WHERE id = $1 AND owner_id = $2`,
+      `SELECT id, title, status, property_id FROM announcements WHERE id = $1 AND owner_id = $2`,
       [id, uid]
     );
     if (current.rows.length === 0) {
@@ -2555,17 +2843,45 @@ router.patch("/announcements/:id/publish", async (req, res) => {
       return res.status(409).json({ success: false, message: `Cannot publish a ${cur} announcement` });
     }
 
-    const result = await pool.query(
-      `UPDATE announcements
-       SET status = 'published',
-           published_at = COALESCE(published_at, NOW()),
-           updated_at = NOW()
-       WHERE id = $1 AND owner_id = $2
-       RETURNING id, status, published_at, updated_at`,
-      [id, uid]
-    );
+    // Publishing and the fan-out to that property's tenants share this
+    // transaction, so a tenant is never told about an unpublished announcement.
+    const client = await pool.connect();
+    let a;
+    try {
+      await client.query("BEGIN");
 
-    const a = result.rows[0];
+      const result = await client.query(
+        `UPDATE announcements
+         SET status = 'published',
+             published_at = COALESCE(published_at, NOW()),
+             updated_at = NOW()
+         WHERE id = $1 AND owner_id = $2
+         RETURNING id, status, published_at, updated_at`,
+        [id, uid]
+      );
+      a = result.rows[0];
+
+      if (current.rows[0].property_id) {
+        const property = await client.query(
+          `SELECT name FROM properties WHERE id = $1`,
+          [current.rows[0].property_id]
+        );
+        await notifyAnnouncementPublished(client, {
+          announcementId: a.id,
+          title: current.rows[0].title,
+          propertyId: current.rows[0].property_id,
+          propertyName: property.rows[0]?.name || "your dormitory",
+        });
+      }
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+
     return res.json({
       success: true,
       message: "Announcement published",
@@ -2650,5 +2966,271 @@ router.delete("/announcements/:id", async (req, res) => {
 // ─── Messages ────────────────────────────────────────────
 // Messaging lives under /api/messages (backend/routes/messages.js) so owners
 // and tenants share one secure, relationship-checked implementation.
+
+// ─── Property Photos ─────────────────────────────────────
+const fs = require("fs");
+const path = require("path");
+const upload = require("../middleware/propertyPhotoUpload");
+
+// Helper: verify property exists AND is owned by this owner.
+// Owner-scoped on purpose — a property owned by someone else matches no rows,
+// exactly like a missing one, so both answer 404 and existence is never
+// confirmed to a non-owner. (Shared by the property photos endpoints.)
+async function assertOwnerProperty(uid, propertyId) {
+  const result = await pool.query(
+    `SELECT id FROM properties WHERE id = $1 AND owner_id = $2`,
+    [propertyId, uid]
+  );
+  if (result.rows.length === 0) return { ok: false, status: 404, message: "Property not found" };
+  return { ok: true };
+}
+
+// Helper: verify a photo row belongs to a property owned by this owner.
+async function assertOwnerPhoto(uid, propertyId, photoId) {
+  const propCheck = await assertOwnerProperty(uid, propertyId);
+  if (!propCheck.ok) return propCheck;
+  const photoResult = await pool.query(
+    `SELECT id FROM property_photos WHERE id = $1 AND property_id = $2`,
+    [photoId, propertyId]
+  );
+  if (photoResult.rows.length === 0) return { ok: false, status: 404, message: "Photo not found" };
+  return { ok: true };
+}
+
+// List property photos
+router.get("/properties/:id/photos", async (req, res) => {
+  try {
+    const uid = req.user.userId;
+    const { id } = req.params;
+
+    const propCheck = await assertOwnerProperty(uid, id);
+    if (!propCheck.ok) {
+      return res.status(propCheck.status).json({ success: false, message: propCheck.message });
+    }
+
+    const result = await pool.query(
+      `SELECT id, photo_url, is_primary, created_at
+       FROM property_photos
+       WHERE property_id = $1
+       ORDER BY is_primary DESC, created_at ASC`,
+      [id]
+    );
+
+    return res.json({
+      success: true,
+      data: result.rows.map((r) => ({
+        id: r.id,
+        photoUrl: toPublicPhotoUrl(req, r.photo_url),
+        isPrimary: r.is_primary,
+        createdAt: r.created_at,
+      })),
+    });
+  } catch (error) {
+    console.error("Get property photos error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// Upload a property photo. multer runs first; any validation error (e.g.
+// unsupported MIME type or oversized file) is converted to a JSON 400 so the
+// app can surface it instead of the default HTML error page.
+router.post(
+  "/properties/:id/photos",
+  (req, res, next) => {
+    console.log("PHOTO UPLOAD REQUEST — pre-multer");
+    console.log("  method:", req.method, "url:", req.originalUrl);
+    console.log("  params:", req.params);
+    console.log("  user:", req.user);
+    console.log("  UPLOAD CONTENT TYPE:", req.headers["content-type"]);
+    console.log("  content-length:", req.get("Content-Length"));
+
+    upload.single("photo")(req, res, (err) => {
+      if (err) {
+        console.error("  multer error:", err.code, err.message);
+        return res.status(400).json({ success: false, message: err.message || "Upload failed" });
+      }
+      next();
+    });
+  },
+  async (req, res) => {
+  try {
+    const uid = req.user.userId;
+    const { id } = req.params;
+
+    console.log("PHOTO UPLOAD — post-multer");
+    console.log("  UPLOAD BODY:", req.body);
+    console.log("  UPLOAD FILE:", req.file ? {
+      fieldname: req.file.fieldname,
+      originalname: req.file.originalname,
+      encoding: req.file.encoding,
+      mimetype: req.file.mimetype,
+      size: req.file.size,
+      path: req.file.path,
+    } : undefined);
+
+    if (!req.file || !req.file.size) {
+      if (req.file) {
+        try { fs.unlinkSync(req.file.path); } catch {}
+      }
+      const receivedAsText = req.body && typeof req.body.photo === "string";
+      console.warn("  no usable file part", receivedAsText ? "(photo arrived as text, not a file)" : "");
+      return res.status(400).json({
+        success: false,
+        message: "No photo file was received",
+      });
+    }
+
+    const propCheck = await assertOwnerProperty(uid, id);
+    if (!propCheck.ok) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+      return res.status(propCheck.status).json({ success: false, message: propCheck.message });
+    }
+
+    // HEIC/HEIF (iPhone photos) are converted to JPEG before storage so every
+    // client can display them. Other formats pass through unchanged.
+    let finalFilename;
+    try {
+      finalFilename = await upload.normalizePropertyPhoto(req.file);
+    } catch (conversionError) {
+      console.error("Property photo conversion error:", conversionError);
+      try { fs.unlinkSync(req.file.path); } catch {}
+      return res.status(400).json({
+        success: false,
+        message: conversionError instanceof Error ? conversionError.message : "Unsupported image format",
+      });
+    }
+
+    const storedPath = toStoredPhotoPath(finalFilename);
+    const photoUrl = toPublicPhotoUrl(req, storedPath);
+
+    const countResult = await pool.query(
+      `SELECT COUNT(*)::int AS cnt FROM property_photos WHERE property_id = $1`,
+      [id]
+    );
+    const isFirst = countResult.rows[0].cnt === 0;
+
+    const result = await pool.query(
+      `INSERT INTO property_photos (property_id, photo_url, is_primary)
+       VALUES ($1, $2, $3)
+       RETURNING id, photo_url, is_primary, created_at`,
+      [id, storedPath, isFirst]
+    );
+
+    const p = result.rows[0];
+    console.log("  Photo stored:", photoUrl);
+    return res.status(201).json({
+      success: true,
+      message: "Photo uploaded",
+      data: {
+        id: p.id,
+        photoUrl,
+        isPrimary: p.is_primary,
+        createdAt: p.created_at,
+      },
+    });
+  } catch (error) {
+    console.error("Upload property photo error:", error);
+    if (req.file) {
+      try { fs.unlinkSync(req.file.path); } catch {}
+    }
+    if (error.code === "LIMIT_FILE_SIZE") {
+      return res.status(400).json({ success: false, message: "File too large. Maximum size is 10MB." });
+    }
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// Delete a property photo
+router.delete("/properties/:propertyId/photos/:photoId", async (req, res) => {
+  try {
+    const uid = req.user.userId;
+    const { propertyId, photoId } = req.params;
+
+    const photoCheck = await assertOwnerPhoto(uid, propertyId, photoId);
+    if (!photoCheck.ok) {
+      return res.status(photoCheck.status).json({ success: false, message: photoCheck.message });
+    }
+
+    // Get the photo file path before deleting from DB
+    const photoResult = await pool.query(
+      `SELECT id, photo_url, is_primary FROM property_photos WHERE id = $1`,
+      [photoId]
+    );
+    const photo = photoResult.rows[0];
+
+    // Delete from DB
+    await pool.query(`DELETE FROM property_photos WHERE id = $1`, [photoId]);
+
+    // If deleted photo was primary, promote the oldest remaining photo.
+    // PostgreSQL does not support ORDER BY/LIMIT directly in UPDATE, so the
+    // target row is selected in a subquery.
+    if (photo.is_primary) {
+      await pool.query(
+        `UPDATE property_photos SET is_primary = true
+         WHERE id = (
+           SELECT id FROM property_photos
+           WHERE property_id = $1
+           ORDER BY created_at ASC
+           LIMIT 1
+         )`,
+        [propertyId]
+      );
+    }
+
+    // Delete the file from disk
+    if (photo.photo_url) {
+      try {
+        const pathname = /^https?:\/\//i.test(photo.photo_url)
+          ? new URL(photo.photo_url).pathname
+          : photo.photo_url;
+        const filePath = path.join(__dirname, "..", pathname.replace(/^\/+/, ""));
+        if (fs.existsSync(filePath)) fs.unlinkSync(filePath);
+      } catch {}
+    }
+
+    return res.json({ success: true, message: "Photo deleted" });
+  } catch (error) {
+    console.error("Delete property photo error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// Set a photo as primary
+router.patch("/properties/:propertyId/photos/:photoId/primary", async (req, res) => {
+  try {
+    const uid = req.user.userId;
+    const { propertyId, photoId } = req.params;
+
+    const photoCheck = await assertOwnerPhoto(uid, propertyId, photoId);
+    if (!photoCheck.ok) {
+      return res.status(photoCheck.status).json({ success: false, message: photoCheck.message });
+    }
+
+    // Unset all primary, then set this one
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `UPDATE property_photos SET is_primary = false WHERE property_id = $1`,
+        [propertyId]
+      );
+      await client.query(
+        `UPDATE property_photos SET is_primary = true WHERE id = $1 AND property_id = $2`,
+        [photoId, propertyId]
+      );
+      await client.query("COMMIT");
+    } catch (err) {
+      await client.query("ROLLBACK");
+      throw err;
+    } finally {
+      client.release();
+    }
+
+    return res.json({ success: true, message: "Primary photo updated" });
+  } catch (error) {
+    console.error("Set primary photo error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
 
 module.exports = router;

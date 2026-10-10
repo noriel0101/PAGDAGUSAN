@@ -255,10 +255,26 @@ async function testOwnerADetails() {
   const sep = (trend ?? []).find((t) => t.period === "2026-09");
   assert("Trend includes 2026-09 with 5000/1", sep?.amount === 5000 && sep?.count === 1, `${JSON.stringify(sep)}`);
 
+  r = await req("GET", "/api/owner/reports/payment-trend?bucket=week", null, ownerAToken);
+  assert("Weekly payment trend → 200", r.status === 200, `status=${r.status}`);
+  assert("Weekly payment trend is array", Array.isArray(dataOf(r)), `${JSON.stringify(dataOf(r))}`);
+
   r = await req("GET", "/api/owner/reports/maintenance", null, ownerAToken);
   const maint = dataOf(r);
   assert("Maintenance pending = 1", maint?.maintenance.pending === 1, `${maint?.maintenance.pending}`);
   assert("Maintenance avgCompletionHours = null (none completed)", maint?.maintenance.avgCompletionHours === null, `${maint?.maintenance.avgCompletionHours}`);
+  assert("Maintenance byCategory includes plumbing",
+    Array.isArray(maint?.byCategory) && maint.byCategory.some((c) => c.category === "plumbing" && c.count >= 1),
+    `${JSON.stringify(maint?.byCategory)}`);
+  assert("Maintenance byPriority includes high",
+    Array.isArray(maint?.byPriority) && maint.byPriority.some((p) => p.priority === "high" && p.count >= 1),
+    `${JSON.stringify(maint?.byPriority)}`);
+
+  r = await req("GET", "/api/owner/reports/maintenance-trend", null, ownerAToken);
+  assert("Maintenance trend → 200", r.status === 200, `status=${r.status}`);
+  const mTrend = dataOf(r);
+  assert("Maintenance trend is a non-empty array", Array.isArray(mTrend) && mTrend.length >= 1, `${JSON.stringify(mTrend)}`);
+  assert("Maintenance trend month total >= 1", (mTrend ?? []).some((t) => t.total >= 1), `${JSON.stringify(mTrend)}`);
 
   r = await req("GET", "/api/owner/reports/announcements", null, ownerAToken);
   const ann = dataOf(r);
@@ -293,6 +309,9 @@ async function testIsolation() {
 
   r = await req("GET", "/api/owner/reports/payment-trend", null, ownerBToken);
   assert("Owner B trend is empty", Array.isArray(dataOf(r)) && dataOf(r).length === 0, `${JSON.stringify(dataOf(r))}`);
+
+  r = await req("GET", "/api/owner/reports/maintenance-trend", null, ownerBToken);
+  assert("Owner B maintenance trend is empty", Array.isArray(dataOf(r)) && dataOf(r).length === 0, `${JSON.stringify(dataOf(r))}`);
 }
 
 // ─── Empty / no-property owner ────────────────────────────
@@ -322,6 +341,9 @@ async function testEmptyOwner() {
 
   r = await req("GET", "/api/owner/reports/maintenance", null, ownerCtoken);
   assert("Empty owner maintenance avg = null", dataOf(r)?.maintenance.avgCompletionHours === null, `${JSON.stringify(dataOf(r))}`);
+
+  r = await req("GET", "/api/owner/reports/maintenance-trend", null, ownerCtoken);
+  assert("Empty owner maintenance trend empty", Array.isArray(dataOf(r)) && dataOf(r).length === 0, `${JSON.stringify(dataOf(r))}`);
 }
 
 // ─── Role isolation ───────────────────────────────────────

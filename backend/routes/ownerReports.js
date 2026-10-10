@@ -442,13 +442,17 @@ router.get("/payments", async (req, res) => {
   }
 });
 
-// ─── Payment trend (monthly totals, paid only) ───────────
+// ─── Payment trend (paid only; monthly by default, weekly with ?bucket=week) ─
 router.get("/payment-trend", async (req, res) => {
   try {
     const uid = req.user.userId;
+    const weekly = String(req.query.bucket || "") === "week";
+    const periodExpr = weekly
+      ? `TO_CHAR(date_trunc('week', p.payment_date), 'YYYY-MM-DD')`
+      : `TO_CHAR(p.payment_date, 'YYYY-MM')`;
 
     const result = await pool.query(
-      `SELECT TO_CHAR(p.payment_date, 'YYYY-MM') AS month,
+      `SELECT ${periodExpr} AS month,
               SUM(p.amount)::numeric AS amount,
               COUNT(*)::int AS count
        FROM payments p
@@ -483,23 +487,43 @@ router.get("/maintenance", async (req, res) => {
   try {
     const uid = req.user.userId;
 
-    const result = await pool.query(
-      `SELECT
-         COUNT(*)::int AS total,
-         COUNT(*) FILTER (WHERE m.status = 'pending')::int AS pending,
-         COUNT(*) FILTER (WHERE m.status = 'reviewing')::int AS reviewing,
-         COUNT(*) FILTER (WHERE m.status = 'in_progress')::int AS in_progress,
-         COUNT(*) FILTER (WHERE m.status = 'completed')::int AS completed,
-         COUNT(*) FILTER (WHERE m.status = 'cancelled')::int AS cancelled,
-         COUNT(*) FILTER (WHERE m.priority IN ('high', 'urgent'))::int AS high_priority,
-         ROUND(AVG(EXTRACT(EPOCH FROM (m.completed_at - m.created_at)) / 3600) FILTER (WHERE m.status = 'completed'))::int AS avg_completion_hours
-       FROM maintenance_requests m
-       JOIN rooms r ON r.id = m.room_id
-       WHERE EXISTS (SELECT 1 FROM properties p WHERE p.id = r.property_id AND p.owner_id = $1)`,
-      [uid]
-    );
+    const [statsResult, categoryResult, priorityResult] = await Promise.all([
+      pool.query(
+        `SELECT
+           COUNT(*)::int AS total,
+           COUNT(*) FILTER (WHERE m.status = 'pending')::int AS pending,
+           COUNT(*) FILTER (WHERE m.status = 'reviewing')::int AS reviewing,
+           COUNT(*) FILTER (WHERE m.status = 'in_progress')::int AS in_progress,
+           COUNT(*) FILTER (WHERE m.status = 'completed')::int AS completed,
+           COUNT(*) FILTER (WHERE m.status = 'cancelled')::int AS cancelled,
+           COUNT(*) FILTER (WHERE m.priority IN ('high', 'urgent'))::int AS high_priority,
+           ROUND(AVG(EXTRACT(EPOCH FROM (m.completed_at - m.created_at)) / 3600) FILTER (WHERE m.status = 'completed'))::int AS avg_completion_hours
+         FROM maintenance_requests m
+         JOIN rooms r ON r.id = m.room_id
+         WHERE EXISTS (SELECT 1 FROM properties p WHERE p.id = r.property_id AND p.owner_id = $1)`,
+        [uid]
+      ),
+      pool.query(
+        `SELECT m.category::text AS category, COUNT(*)::int AS count
+         FROM maintenance_requests m
+         JOIN rooms r ON r.id = m.room_id
+         WHERE EXISTS (SELECT 1 FROM properties p WHERE p.id = r.property_id AND p.owner_id = $1)
+         GROUP BY 1
+         ORDER BY count DESC, category ASC`,
+        [uid]
+      ),
+      pool.query(
+        `SELECT m.priority::text AS priority, COUNT(*)::int AS count
+         FROM maintenance_requests m
+         JOIN rooms r ON r.id = m.room_id
+         WHERE EXISTS (SELECT 1 FROM properties p WHERE p.id = r.property_id AND p.owner_id = $1)
+         GROUP BY 1
+         ORDER BY count DESC, priority ASC`,
+        [uid]
+      ),
+    ]);
 
-    const m = result.rows[0];
+    const m = statsResult.rows[0];
     return res.json({
       success: true,
       data: {
@@ -513,10 +537,60 @@ router.get("/maintenance", async (req, res) => {
           highPriority: m.high_priority,
           avgCompletionHours: m.avg_completion_hours,
         },
+        byCategory: categoryResult.rows.map((row) => ({
+          category: row.category,
+          count: row.count,
+        })),
+        byPriority: priorityResult.rows.map((row) => ({
+          priority: row.priority,
+          count: row.count,
+        })),
       },
     });
   } catch (error) {
     console.error("Owner maintenance report error:", error);
+    return res.status(500).json({ success: false, message: "Unable to load report" });
+  }
+});
+
+// ─── Maintenance trend (monthly request volume) ──────────
+router.get("/maintenance-trend", async (req, res) => {
+  try {
+    const uid = req.user.userId;
+    const weekly = String(req.query.bucket || "") === "week";
+    const periodExpr = weekly
+      ? `TO_CHAR(date_trunc('week', m.created_at), 'YYYY-MM-DD')`
+      : `TO_CHAR(m.created_at, 'YYYY-MM')`;
+
+    const result = await pool.query(
+      `SELECT ${periodExpr} AS month,
+              COUNT(*)::int AS total,
+              COUNT(*) FILTER (WHERE m.status = 'pending')::int AS pending,
+              COUNT(*) FILTER (WHERE m.status IN ('reviewing', 'in_progress'))::int AS open,
+              COUNT(*) FILTER (WHERE m.status = 'completed')::int AS completed
+       FROM maintenance_requests m
+       JOIN rooms r ON r.id = m.room_id
+       WHERE EXISTS (SELECT 1 FROM properties p WHERE p.id = r.property_id AND p.owner_id = $1)
+       GROUP BY 1
+       ORDER BY 1 DESC
+       LIMIT 12`,
+      [uid]
+    );
+
+    return res.json({
+      success: true,
+      data: result.rows
+        .map((row) => ({
+          period: row.month,
+          total: row.total,
+          pending: row.pending,
+          open: row.open,
+          completed: row.completed,
+        }))
+        .reverse(),
+    });
+  } catch (error) {
+    console.error("Owner maintenance trend error:", error);
     return res.status(500).json({ success: false, message: "Unable to load report" });
   }
 });

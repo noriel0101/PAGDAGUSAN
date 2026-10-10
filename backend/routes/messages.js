@@ -2,6 +2,7 @@ const express = require("express");
 const pool = require("../db");
 const requireAuth = require("../middleware/auth");
 const requireRole = require("../middleware/role");
+const { notifyMessageReceived } = require("../services/notifications");
 
 const router = express.Router();
 
@@ -235,7 +236,8 @@ router.post("/", async (req, res) => {
     if (receiverResult.rows.length === 0) {
       return res.status(404).json({ success: false, message: "Receiver not found" });
     }
-    if (!["owner", "tenant"].includes(receiverResult.rows[0].role)) {
+    const receiver = receiverResult.rows[0];
+    if (!["owner", "tenant"].includes(receiver.role)) {
       return res
         .status(403)
         .json({ success: false, message: "You are not authorized to message this user" });
@@ -248,17 +250,41 @@ router.post("/", async (req, res) => {
         .json({ success: false, message: "You are not authorized to message this user" });
     }
 
-    const result = await pool.query(
-      `INSERT INTO messages (sender_id, receiver_id, content)
-       VALUES ($1, $2, $3)
-       RETURNING id, content, is_read, created_at, sender_id, receiver_id`,
-      [senderId, receiverId, message.trim()]
-    );
+    // The message row and the receiver's notification are committed together.
+    const client = await pool.connect();
+    let sentMessage;
+    try {
+      await client.query("BEGIN");
+
+      const result = await client.query(
+        `INSERT INTO messages (sender_id, receiver_id, content)
+         VALUES ($1, $2, $3)
+         RETURNING id, content, is_read, created_at, sender_id, receiver_id`,
+        [senderId, receiverId, message.trim()]
+      );
+      sentMessage = result.rows[0];
+
+      const senderResult = await client.query(`SELECT name FROM users WHERE id = $1`, [senderId]);
+      await notifyMessageReceived(client, {
+        recipientId: receiverId,
+        senderName:
+          senderResult.rows[0]?.name || (receiver.role === "owner" ? "A tenant" : "A dorm owner"),
+        messageId: sentMessage.id,
+        content: sentMessage.content,
+      });
+
+      await client.query("COMMIT");
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
 
     return res.status(201).json({
       success: true,
       message: "Message sent",
-      data: mapThreadMessage(result.rows[0]),
+      data: mapThreadMessage(sentMessage),
     });
   } catch (error) {
     console.error("Send message error:", error);
@@ -313,6 +339,58 @@ router.patch("/:id/read", async (req, res) => {
     });
   } catch (error) {
     console.error("Mark message read error:", error);
+    return res.status(500).json({ success: false, message: "Server error" });
+  }
+});
+
+// Deletes the signed-in user's conversation with one person, and the
+// message notifications that pointed at those messages.
+router.delete("/conversations/:userId", async (req, res) => {
+  try {
+    const uid = req.user.userId;
+    const { userId } = req.params;
+
+    if (!UUID_RE.test(userId)) {
+      return res.status(400).json({ success: false, message: "Invalid user id" });
+    }
+    if (userId === uid) {
+      return res.status(403).json({ success: false, message: "You cannot delete a conversation with yourself" });
+    }
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      const removed = await client.query(
+        `DELETE FROM messages
+         WHERE (sender_id = $1 AND receiver_id = $2)
+            OR (sender_id = $2 AND receiver_id = $1)
+         RETURNING id`,
+        [uid, userId]
+      );
+      const ids = removed.rows.map((row) => row.id);
+      if (ids.length > 0) {
+        await client.query(
+          `DELETE FROM notifications
+           WHERE recipient_id = $1
+             AND related_type = 'message'
+             AND related_id = ANY($2::uuid[])`,
+          [uid, ids]
+        );
+      }
+      await client.query("COMMIT");
+      return res.json({
+        success: true,
+        message: "Conversation deleted",
+        deleted: ids.length,
+      });
+    } catch (error) {
+      await client.query("ROLLBACK").catch(() => {});
+      throw error;
+    } finally {
+      client.release();
+    }
+  } catch (error) {
+    console.error("Delete conversation error:", error);
     return res.status(500).json({ success: false, message: "Server error" });
   }
 });
